@@ -7,6 +7,10 @@ variables:
   TESTING_IMAGE: $CI_REGISTRY_IMAGE:testing-$CI_COMMIT_SHA
   RELEASE_IMAGE: $CI_REGISTRY_IMAGE:latest
 
+  RCLONE_CONFIG_COLAB_CLIENT_ID: ${RCLONE_CONFIG_COLAB_CLIENT_ID}
+  RCLONE_CONFIG_COLAB_CLIENT_SECRET: ${RCLONE_CONFIG_COLAB_CLIENT_SECRET}
+  RCLONE_CONFIG_COLAB_TOKEN: ${RCLONE_CONFIG_COLAB_TOKEN}
+
 build:
   image: docker:latest
   services:
@@ -157,3 +161,89 @@ release:
     - docker push $RELEASE_IMAGE
   only:
     - master
+
+colab:
+  image: docker:latest
+  services:
+    - docker:dind
+  stage: release
+  before_script:
+    - apk add perl
+  script:
+    - mkdir -p tutorials-colab
+    - for src in $(find tutorials -type f -name 'tutorial_*.ipynb'); do
+        dest=tutorials-colab/$(dirname ${src#tutorials/})/$(basename $src);
+        mkdir -p $(dirname $dest);
+        mv $src $dest;
+        sed -i "s|<img src=\\\\\"data|<img src=\\\\\"https://gitlab.com/RBniCS/RBniCS/-/raw/master/$(dirname $src)/data|g" $dest;
+        echo "# Install FEniCS" > 01-setup-fenics.py;
+        echo "try:" >> 01-setup-fenics.py;
+        echo "    import dolfin" >> 01-setup-fenics.py;
+        echo "except ImportError as e:" >> 01-setup-fenics.py;
+        echo "    !apt-get install -y -qq software-properties-common" >> 01-setup-fenics.py;
+        echo "    !add-apt-repository -y ppa:fenics-packages/fenics" >> 01-setup-fenics.py;
+        echo "    !apt-get update -qq" >> 01-setup-fenics.py;
+        echo "    !apt install -y --no-install-recommends fenics" >> 01-setup-fenics.py;
+        echo "    !sed -i 's|#if PETSC_VERSION_MAJOR == 3 && PETSC_VERSION_MINOR <= 8 && PETSC_VERSION_RELEASE == 1|#if 1|' /usr/include/dolfin/la/PETScLUSolver.h" >> 01-setup-fenics.py;
+        echo "    !pip3 -q install --upgrade sympy" >> 01-setup-fenics.py;
+        echo "    import dolfin" >> 01-setup-fenics.py;
+        echo "# Install RBniCS" > 02-setup-rbnics.py;
+        echo "try:" >> 02-setup-rbnics.py;
+        echo "    import rbnics" >> 02-setup-rbnics.py;
+        echo "except ImportError as e:" >> 02-setup-rbnics.py;
+        echo "    !pip3 -q install --upgrade cvxopt multipledispatch pylru toposort" >> 02-setup-rbnics.py;
+        echo "    ![ -d "/tmp/RBniCS" ] || git clone https://gitlab.com/RBniCS/RBniCS.git /tmp/RBniCS" >> 02-setup-rbnics.py;
+        echo "    !cd /tmp/RBniCS && python3 setup.py install && cd -" >> 02-setup-rbnics.py;
+        echo "    !ln -s /usr/local/lib/python3.6/dist-packages/RBniCS*egg/rbnics /usr/local/lib/python3.6/dist-packages/" >> 02-setup-rbnics.py;
+        echo "    !wget https://gitlab.com/RBniCS/RBniCS-jupyter/-/raw/master/docker/rbnics.patch -P /tmp/" >> 02-setup-rbnics.py;
+        echo "    !cd /usr/local/lib/python3.6/dist-packages/rbnics && patch -p2 < /tmp/rbnics.patch && cd -" >> 02-setup-rbnics.py;
+        echo "    import rbnics" >> 02-setup-rbnics.py;
+        echo "import rbnics.utils.config" >> 02-setup-rbnics.py;
+        echo "assert \"dolfin\" in rbnics.utils.config.config.get(\"backends\", \"required backends\")" >> 02-setup-rbnics.py;
+        rm -f 03-create-aux-dirs.py;
+        rm -f 04-download-aux-files.py;
+        for aux_file in $(find $(dirname $src) \( -type f -o -type l \) -not -path '*.ipynb' -not -name .gitignore); do
+            if [ -L $aux_file ]; then
+              aux_link_dest=$aux_file;
+              while [ -L $aux_link_dest ]; do
+                aux_link_dest=$(readlink -f $aux_link_dest);
+              done;
+              if [ -f $aux_link_dest ]; then
+                aux_url=https://gitlab.com/RBniCS/RBniCS/-/raw/master/${aux_link_dest#$PWD/};
+              else
+                continue;
+              fi;
+            else
+              aux_url=https://gitlab.com/RBniCS/RBniCS/-/raw/master/${aux_file};
+            fi;
+            aux_file=${aux_file#$(dirname $src)/};
+            aux_dir="${aux_file%/*}";
+            echo "!mkdir -p ${aux_dir}" >> 03-create-aux-dirs.py;
+            echo "![ -f ${aux_file} ] || wget ${aux_url} -O ${aux_file}" >> 04-download-aux-files.py;
+        done;
+        echo "# Download data files" > 03-04-create-aux-dirs-and-download-aux-files.py;
+        sort -u 03-create-aux-dirs.py >> 03-04-create-aux-dirs-and-download-aux-files.py;
+        sort -u 04-download-aux-files.py >> 03-04-create-aux-dirs-and-download-aux-files.py;
+        colon=":";
+        new_cells="";
+        for cell_file in 01-setup-fenics.py 02-setup-rbnics.py 03-04-create-aux-dirs-and-download-aux-files.py; do
+          new_cells="${new_cells}  \{\n";
+          new_cells="${new_cells}   \"cell_type\"$colon \"code\",\n";
+          new_cells="${new_cells}   \"execution_count\"$colon null,\n";
+          new_cells="${new_cells}   \"metadata\"$colon \{\},\n";
+          new_cells="${new_cells}   \"outputs\"$colon [],\n";
+          new_cells="${new_cells}   \"source\"$colon [\n";
+          cell_content=$(sed -e 's/\"/\\\\"/g' -e 's/^/    \"/' -e 's/$/\\\\n\",/' -e '$s/\\\\n\",$/\"\\n/' $cell_file);
+          new_cells="${new_cells}${cell_content}";
+          new_cells="${new_cells}   ]\n";
+          new_cells="${new_cells}  \},\n";
+        done;
+        perl -0777 -i -pe "s%  \},\n  \{\n   \"cell_type\"$colon \"code\",%  \},\n$new_cells  \{\n   \"cell_type\"$colon \"code\",%" $dest;
+      done
+    - docker run --rm --volume $PWD/tutorials-colab:/data --env RCLONE_CONFIG_COLAB_TYPE=drive --env RCLONE_CONFIG_COLAB_SCOPE=drive --env RCLONE_CONFIG_COLAB_CLIENT_ID=$RCLONE_CONFIG_COLAB_CLIENT_ID --env RCLONE_CONFIG_COLAB_CLIENT_SECRET=$RCLONE_CONFIG_COLAB_CLIENT_SECRET --env RCLONE_CONFIG_COLAB_TOKEN="$RCLONE_CONFIG_COLAB_TOKEN" rclone/rclone copy -v /data colab:RBniCS-jupyter
+  only:
+    refs:
+      - master
+      - colab
+    variables:
+      - $RCLONE_CONFIG_COLAB_CLIENT_ID
